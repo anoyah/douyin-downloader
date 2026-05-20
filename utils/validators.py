@@ -61,6 +61,23 @@ def normalize_short_url(url: str) -> str:
     return f"https://{stripped}"
 
 
+_DOUYIN_URL_RE = re.compile(
+    r"https?://(?:"
+    r"v\.douyin\.com"
+    r"|v\.iesdouyin\.com"
+    r"|iesdouyin\.com"
+    r"|(?:www\.)?douyin\.com"
+    r"|live\.douyin\.com"
+    r")/[^\s\"'<>]+"
+)
+
+
+def extract_douyin_url(text: str) -> Optional[str]:
+    """从分享文案等任意文本中提取第一个抖音 URL。"""
+    m = _DOUYIN_URL_RE.search(text or "")
+    return m.group(0).rstrip(".,，。）)】") if m else None
+
+
 def parse_url_type(url: str) -> Optional[str]:
     # 短链在调用方（CLI/调度层）统一先解析为真实 URL 后再判断类型；
     # 若仍是短链，返回 'short' 明确提示需要解析，而不是错误地全部落到 'video'。
