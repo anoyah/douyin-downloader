@@ -1,10 +1,13 @@
 #!/usr/bin/env python3
 """
-本地 HTTP 服务。
+RESTful HTTP 服务。
 
 端点：
-  GET /get_url?url=<抖音链接或分享文案>   → 302 跳转到无水印直链（在线播放）
-  GET /download?url=<抖音链接或分享文案>  → 代理流式下载（手机浏览器直接保存）
+  GET /api/resolve?url=<抖音链接或分享文案>
+      → JSON { code, message, data: { title, url } }
+
+  GET /proxy?url=<抖音链接或分享文案>
+      → 流式视频（video/mp4，Content-Disposition: attachment）
 
 启动：python server.py [port]   （默认 8080）
 """
@@ -27,7 +30,32 @@ from utils.validators import extract_douyin_url, is_short_url, normalize_short_u
 
 CHUNK_SIZE = 256 * 1024  # 256 KB
 
+# ── 跨域（开发期允许所有来源） ────────────────────────────────────────────
+CORS_HEADERS = {
+    "Access-Control-Allow-Origin": "*",
+    "Access-Control-Allow-Methods": "GET, OPTIONS",
+    "Access-Control-Allow-Headers": "Content-Type",
+}
 
+
+def _json(data: dict, status: int = 200) -> web.Response:
+    return web.Response(
+        status=status,
+        content_type="application/json",
+        headers=CORS_HEADERS,
+        text=json.dumps(data, ensure_ascii=False),
+    )
+
+
+def _ok(data: dict) -> web.Response:
+    return _json({"code": 0, "message": "ok", "data": data})
+
+
+def _err(message: str, status: int = 422) -> web.Response:
+    return _json({"code": 1, "message": message, "data": None}, status=status)
+
+
+# ── 内部工具 ─────────────────────────────────────────────────────────────
 def _make_downloader(app: web.Application) -> VideoDownloader:
     return VideoDownloader(
         config=app["config"],
@@ -41,12 +69,9 @@ def _make_downloader(app: web.Application) -> VideoDownloader:
     )
 
 
-async def _resolve(
-    raw: str, app: web.Application
-) -> Tuple[str, Dict[str, str], str]:
+async def _resolve(raw: str, app: web.Application) -> Tuple[str, Dict[str, str], str]:
     """从原始文本解析出 (video_url, cdn_headers, title)。"""
     url = extract_douyin_url(raw) or raw
-
     api_client: DouyinAPIClient = app["api_client"]
 
     if is_short_url(url):
@@ -79,53 +104,57 @@ def _safe_filename(title: str) -> str:
     return (name[:80] or "video") + ".mp4"
 
 
-def _error(status: int, msg: str) -> web.Response:
-    return web.Response(
-        status=status,
-        content_type="application/json",
-        text=json.dumps({"error": msg}, ensure_ascii=False),
-    )
+# ── 路由处理 ─────────────────────────────────────────────────────────────
+async def handle_health(request: web.Request) -> web.Response:
+    return _json({"status": "ok"})
 
 
-async def handle_get_url(request: web.Request) -> web.Response:
+async def handle_options(request: web.Request) -> web.Response:
+    return web.Response(status=204, headers=CORS_HEADERS)
+
+
+async def handle_resolve(request: web.Request) -> web.Response:
+    """GET /api/resolve?url=<文本>  →  JSON"""
     raw = request.rel_url.query.get("url", "").strip()
     if not raw:
-        return _error(400, "缺少 url 参数")
+        return _err("缺少 url 参数", 400)
+
     try:
-        video_url, _, _ = await _resolve(raw, request.app)
-        raise web.HTTPFound(location=video_url)
-    except web.HTTPException:
-        raise
+        video_url, _, title = await _resolve(raw, request.app)
+        return _ok({"title": title, "url": video_url})
     except ValueError as e:
-        return _error(422, str(e))
+        return _err(str(e))
     except Exception as e:
-        return _error(500, f"内部错误: {e}")
+        return _err(f"内部错误: {e}", 500)
 
 
-async def handle_download(request: web.Request) -> web.StreamResponse:
+async def handle_proxy(request: web.Request) -> web.StreamResponse:
+    """GET /proxy?url=<文本>  →  流式视频下载"""
     raw = request.rel_url.query.get("url", "").strip()
     if not raw:
-        return _error(400, "缺少 url 参数")
+        return _err("缺少 url 参数", 400)
 
     try:
         video_url, cdn_headers, title = await _resolve(raw, request.app)
     except ValueError as e:
-        return _error(422, str(e))
+        return _err(str(e))
     except Exception as e:
-        return _error(500, f"内部错误: {e}")
+        return _err(f"内部错误: {e}", 500)
 
     filename = _safe_filename(title)
-    encoded_filename = quote(filename, safe="")  # RFC 5987 percent-encode
+    encoded_filename = quote(filename, safe="")
 
-    # 代理流式转发，手机浏览器会弹出"下载/保存"对话框
     async with aiohttp.ClientSession() as session:
         async with session.get(video_url, headers=cdn_headers) as cdn_resp:
             resp = web.StreamResponse(
                 status=200,
                 headers={
+                    **CORS_HEADERS,
                     "Content-Type": "video/mp4",
-                    # filename= 给旧浏览器兜底，filename*= 给现代浏览器用中文名
-                    "Content-Disposition": f"attachment; filename=\"video.mp4\"; filename*=UTF-8''{encoded_filename}",
+                    "Content-Disposition": (
+                        f"attachment; filename=\"video.mp4\";"
+                        f" filename*=UTF-8''{encoded_filename}"
+                    ),
                     **(
                         {"Content-Length": cdn_resp.headers["Content-Length"]}
                         if "Content-Length" in cdn_resp.headers
@@ -140,6 +169,7 @@ async def handle_download(request: web.Request) -> web.StreamResponse:
             return resp
 
 
+# ── 应用生命周期 ──────────────────────────────────────────────────────────
 async def on_startup(app: web.Application) -> None:
     config = ConfigLoader("config.yml")
     cookie_manager = CookieManager()
@@ -165,14 +195,16 @@ def main() -> None:
     port = int(sys.argv[1]) if len(sys.argv) > 1 else 8080
 
     app = web.Application()
-    app.router.add_get("/get_url", handle_get_url)
-    app.router.add_get("/download", handle_download)
+    app.router.add_route("OPTIONS", "/{path_info:.*}", handle_options)
+    app.router.add_get("/health", handle_health)
+    app.router.add_get("/api/resolve", handle_resolve)
+    app.router.add_get("/proxy", handle_proxy)
     app.on_startup.append(on_startup)
     app.on_cleanup.append(on_cleanup)
 
     print(f"服务启动于 http://0.0.0.0:{port}")
-    print(f"  播放: GET http://<host>:{port}/get_url?url=<抖音链接或分享文案>")
-    print(f"  下载: GET http://<host>:{port}/download?url=<抖音链接或分享文案>")
+    print(f"  解析: GET http://<host>:{port}/api/resolve?url=<文本>")
+    print(f"  下载: GET http://<host>:{port}/proxy?url=<文本>")
     web.run_app(app, host="0.0.0.0", port=port, print=None)
 
 
