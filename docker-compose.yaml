@@ -36,7 +36,7 @@ services:
       dockerfile: Dockerfile
     restart: unless-stopped
     ports:
-      - "3000:3000"                        # 对外暴露，手机访问此端口
+      - "9002:3000"                        # 对外暴露，手机访问此端口
     environment:
       # Next.js rewrites 将 /api/* /proxy 转发到 api 容器
       API_BASE_URL: http://api:8080
